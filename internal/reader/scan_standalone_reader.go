@@ -45,6 +45,14 @@ type ScanReaderOptions struct {
 	// backpressuring scan() to dump() throughput so memory stays flat. Set a
 	// large value to restore the previous effectively-unbounded behavior.
 	DumpQueueSize int `mapstructure:"dump_queue_size" default:"100000"`
+	// BigKeys are key names that must NOT be moved via DUMP/RESTORE. DUMP serializes
+	// the whole value into one reply; for a huge collection (e.g. a 120M-member zset)
+	// that is a multi-GB bulk that blows proto-max-bulk-len and can OOM-crash the
+	// source. Listed keys are instead read incrementally with a type-native cursor
+	// (ZSCAN/HSCAN/SSCAN/LRANGE) and replayed as batched commands — bounded memory on
+	// both ends. Assumes a fresh/flushed target (the rollback recipe flushes it), so no
+	// leading DEL is emitted.
+	BigKeys []string `mapstructure:"big_keys" default:"[]"`
 }
 
 type dbKey struct {
@@ -76,6 +84,8 @@ type scanStandaloneReader struct {
 	needDumpQueue *utils.UniqueQueue
 	subWG         sync.WaitGroup
 	restoreWG     sync.WaitGroup
+	bigKeyWG      sync.WaitGroup // streamers for BigKeys (cursor-read, not DUMP)
+	bigKeySeen    sync.Map       // dedup: SCAN can return a key more than once
 
 	stat struct {
 		Name              string `json:"name"`
@@ -126,9 +136,12 @@ func (r *scanStandaloneReader) StartRead(ctx context.Context) []chan *entry.Entr
 		go r.dump(w)
 		go r.restore(w)
 	}
-	// Close the output channel once every worker's restore() has drained.
+	// Close the output channel once every worker's restore() AND every big-key
+	// streamer has drained. scan() finishes (closing needDumpQueue) before the dump/
+	// restore pipeline drains, so all bigKeyWG.Add() calls happen-before this Wait().
 	go func() {
 		r.restoreWG.Wait()
+		r.bigKeyWG.Wait()
 		close(r.ch)
 	}()
 	return []chan *entry.Entry{r.ch}
@@ -227,6 +240,15 @@ func (r *scanStandaloneReader) scan() {
 			var keys []string
 			cursor, keys = c.Scan(cursor, count)
 			for _, key := range keys {
+				if r.isBigKey(key) {
+					// Stream via cursor instead of DUMP; dedup since SCAN may repeat a key.
+					if _, dup := r.bigKeySeen.LoadOrStore(dbKey{dbId, key}, true); dup {
+						continue
+					}
+					r.bigKeyWG.Add(1)
+					go r.streamBigKey(dbId, key)
+					continue
+				}
 				r.needDumpQueue.Put(dbKey{dbId, key}) // pass value not pointer
 			}
 
@@ -400,6 +422,141 @@ func (r *scanStandaloneReader) restore(w *dumpWorker) {
 		}
 	}
 	log.Infof("[%s] scanStandaloneReader restore finished.", r.stat.Name)
+}
+
+func (r *scanStandaloneReader) isBigKey(key string) bool {
+	for _, k := range r.opts.BigKeys { // operator-listed, tiny — linear is fine
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+// emitBig sends one replayed command for a streamed big key downstream.
+func (r *scanStandaloneReader) emitBig(dbId int, argv []string) {
+	r.ch <- &entry.Entry{DbId: dbId, Argv: argv}
+}
+
+// streamBigKey replays one oversized key into the target via a type-native cursor
+// (ZSCAN/HSCAN/SSCAN/LRANGE/GET) on its own connection — NEVER DUMP, so neither the
+// source nor redis-shake ever materializes the whole value. Runs concurrently with the
+// small-key DUMP pipeline; gated by bigKeyWG so r.ch isn't closed before it finishes.
+// Assumes a fresh target (no leading DEL).
+func (r *scanStandaloneReader) streamBigKey(dbId int, key string) {
+	defer r.bigKeyWG.Done()
+	c := client.NewRedisClient(r.ctx, r.opts.Address, r.opts.Username, r.opts.Password, r.opts.Tls, r.opts.TlsConfig, r.opts.PreferReplica)
+	defer c.Close()
+	if dbId != 0 {
+		if reply := c.DoWithStringReply("SELECT", strconv.Itoa(dbId)); reply != "OK" {
+			log.Panicf("[%s] streamBigKey SELECT failed db=[%d]", r.stat.Name, dbId)
+		}
+	}
+	typ := c.DoWithStringReply("TYPE", key)
+	log.Infof("[%s] streaming big key=[%s] type=[%s] via cursor (no DUMP)", r.stat.Name, key, typ)
+
+	switch typ {
+	case "none":
+		return // key vanished between SCAN and now
+	case "zset":
+		r.streamCursorPairs(c, dbId, key, "ZSCAN", "ZADD", true) // ZSCAN(member,score) -> ZADD score member
+	case "hash":
+		r.streamCursorPairs(c, dbId, key, "HSCAN", "HSET", false) // HSCAN(field,value) -> HSET field value
+	case "set":
+		r.streamCursorMembers(c, dbId, key, "SSCAN", "SADD")
+	case "list":
+		r.streamList(c, dbId, key)
+	case "string":
+		if v := c.Do("GET", key); v != nil {
+			r.emitBig(dbId, []string{"SET", key, v.(string)})
+		}
+	default:
+		log.Panicf("[%s] streamBigKey unsupported type=[%s] key=[%s]", r.stat.Name, typ, key)
+	}
+
+	if p, ok := c.Do("PTTL", key).(int64); ok && p > 0 {
+		r.emitBig(dbId, []string{"PEXPIRE", key, strconv.FormatInt(p, 10)})
+	}
+}
+
+// streamCursorPairs handles ZSCAN/HSCAN: each cursor page is a flat [a,b,a,b,...]
+// list. swap=true emits (b,a) per pair (ZSCAN yields member,score but ZADD wants
+// score,member); swap=false keeps order (HSCAN field,value -> HSET field value).
+func (r *scanStandaloneReader) streamCursorPairs(c *client.Redis, dbId int, key, scanCmd, writeCmd string, swap bool) {
+	const scanCount = 4096
+	const batchPairs = 256
+	var cursor uint64 = 0
+	for {
+		arr := c.Do(scanCmd, key, strconv.FormatUint(cursor, 10), "COUNT", scanCount).([]interface{})
+		cursor, _ = strconv.ParseUint(arr[0].(string), 10, 64)
+		items := arr[1].([]interface{})
+		argv := []string{writeCmd, key}
+		for i := 0; i+1 < len(items); i += 2 {
+			a, b := items[i].(string), items[i+1].(string)
+			if swap {
+				argv = append(argv, b, a)
+			} else {
+				argv = append(argv, a, b)
+			}
+			if len(argv) >= 2+2*batchPairs {
+				r.emitBig(dbId, argv)
+				argv = []string{writeCmd, key}
+			}
+		}
+		if len(argv) > 2 {
+			r.emitBig(dbId, argv)
+		}
+		if cursor == 0 {
+			return
+		}
+	}
+}
+
+// streamCursorMembers handles SSCAN: each page is a flat list of members.
+func (r *scanStandaloneReader) streamCursorMembers(c *client.Redis, dbId int, key, scanCmd, writeCmd string) {
+	const scanCount = 4096
+	const batchN = 512
+	var cursor uint64 = 0
+	for {
+		arr := c.Do(scanCmd, key, strconv.FormatUint(cursor, 10), "COUNT", scanCount).([]interface{})
+		cursor, _ = strconv.ParseUint(arr[0].(string), 10, 64)
+		items := arr[1].([]interface{})
+		argv := []string{writeCmd, key}
+		for _, it := range items {
+			argv = append(argv, it.(string))
+			if len(argv) >= 2+batchN {
+				r.emitBig(dbId, argv)
+				argv = []string{writeCmd, key}
+			}
+		}
+		if len(argv) > 2 {
+			r.emitBig(dbId, argv)
+		}
+		if cursor == 0 {
+			return
+		}
+	}
+}
+
+// streamList replays a list in LRANGE chunks as RPUSH batches (lists have no cursor).
+func (r *scanStandaloneReader) streamList(c *client.Redis, dbId int, key string) {
+	const chunk = 512
+	var start int64 = 0
+	for {
+		reply, ok := c.Do("LRANGE", key, strconv.FormatInt(start, 10), strconv.FormatInt(start+chunk-1, 10)).([]interface{})
+		if !ok || len(reply) == 0 {
+			return
+		}
+		argv := []string{"RPUSH", key}
+		for _, it := range reply {
+			argv = append(argv, it.(string))
+		}
+		r.emitBig(dbId, argv)
+		if len(reply) < chunk {
+			return
+		}
+		start += chunk
+	}
 }
 
 func (r *scanStandaloneReader) Status() interface{} {
