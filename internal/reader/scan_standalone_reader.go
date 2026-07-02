@@ -53,6 +53,18 @@ type ScanReaderOptions struct {
 	// both ends. Assumes a fresh/flushed target (the rollback recipe flushes it), so no
 	// leading DEL is emitted.
 	BigKeys []string `mapstructure:"big_keys" default:"[]"`
+	// StreamLists routes every list-typed key through the cursor path (LRANGE chunks
+	// replayed as RPUSH) instead of DUMP/RESTORE, without having to name each key in
+	// BigKeys. Motivation: on a Dragonfly->Redis rollback, producing the DUMP payload
+	// for lists is the throughput bottleneck (multi-x slower than other types); reading
+	// them with LRANGE bypasses that serialization. Enabled only for the SCAN phase.
+	// scan() classifies each scanned key with a batched TYPE probe; lists go to a bounded
+	// pool of stream workers, everything else keeps the fast pipelined DUMP path.
+	StreamLists bool `mapstructure:"stream_lists" default:"false"`
+	// StreamParallel is the number of pooled connections that drain the list-stream
+	// queue when StreamLists is set (replaces the per-key goroutine used for BigKeys,
+	// which does not scale to a keyspace-sized set of lists). Ignored unless StreamLists.
+	StreamParallel int `mapstructure:"stream_parallel" default:"4"`
 }
 
 type dbKey struct {
@@ -77,15 +89,17 @@ type dumpWorker struct {
 }
 
 type scanStandaloneReader struct {
-	ctx           context.Context
-	dbs           []int
-	opts          *ScanReaderOptions
-	ch            chan *entry.Entry
-	needDumpQueue *utils.UniqueQueue
-	subWG         sync.WaitGroup
-	restoreWG     sync.WaitGroup
-	bigKeyWG      sync.WaitGroup // streamers for BigKeys (cursor-read, not DUMP)
-	bigKeySeen    sync.Map       // dedup: SCAN can return a key more than once
+	ctx             context.Context
+	dbs             []int
+	opts            *ScanReaderOptions
+	ch              chan *entry.Entry
+	needDumpQueue   *utils.UniqueQueue
+	needStreamQueue *utils.UniqueQueue // list keys routed to the stream pool (StreamLists); nil when disabled
+	subWG           sync.WaitGroup
+	restoreWG       sync.WaitGroup
+	bigKeyWG        sync.WaitGroup // per-key streamers for BigKeys (cursor-read, not DUMP)
+	streamPoolWG    sync.WaitGroup // pooled stream workers draining needStreamQueue
+	bigKeySeen      sync.Map       // dedup: SCAN can return a key more than once
 
 	stat struct {
 		Name              string `json:"name"`
@@ -108,7 +122,10 @@ func NewScanStandaloneReader(ctx context.Context, opts *ScanReaderOptions) Reade
 		queueSize = 100000
 	}
 	r.needDumpQueue = utils.NewUniqueQueue(queueSize) // bounded: backpressure scan() to dump() speed (avoids buffering whole keyspace)
-	log.Infof("[%s] scanStandaloneReader init finished. dbs=[%v], dump_queue_size=[%d]", r.stat.Name, r.dbs, queueSize)
+	if opts.StreamLists {
+		r.needStreamQueue = utils.NewUniqueQueue(queueSize) // same bound; list keys handed to the stream pool
+	}
+	log.Infof("[%s] scanStandaloneReader init finished. dbs=[%v], dump_queue_size=[%d], stream_lists=[%v]", r.stat.Name, r.dbs, queueSize, opts.StreamLists)
 	return r
 }
 
@@ -136,12 +153,25 @@ func (r *scanStandaloneReader) StartRead(ctx context.Context) []chan *entry.Entr
 		go r.dump(w)
 		go r.restore(w)
 	}
-	// Close the output channel once every worker's restore() AND every big-key
-	// streamer has drained. scan() finishes (closing needDumpQueue) before the dump/
-	// restore pipeline drains, so all bigKeyWG.Add() calls happen-before this Wait().
+	if r.opts.StreamLists {
+		streamParallel := r.opts.StreamParallel
+		if streamParallel < 1 {
+			streamParallel = 1
+		}
+		log.Infof("[%s] starting %d list-stream worker(s)", r.stat.Name, streamParallel)
+		for i := 0; i < streamParallel; i++ {
+			r.streamPoolWG.Add(1)
+			go r.streamWorker()
+		}
+	}
+	// Close the output channel once every worker's restore(), every per-key big-key
+	// streamer, and every pooled list-stream worker has drained. scan() finishes
+	// (closing needDumpQueue) before the dump/restore pipeline drains, so all
+	// bigKeyWG.Add() calls happen-before this Wait(); streamPoolWG is sized up-front.
 	go func() {
 		r.restoreWG.Wait()
 		r.bigKeyWG.Wait()
+		r.streamPoolWG.Wait()
 		close(r.ch)
 	}()
 	return []chan *entry.Entry{r.ch}
@@ -178,7 +208,7 @@ func (r *scanStandaloneReader) subscribe() {
 		select {
 		case <-r.ctx.Done():
 			log.Infof("[%s] scanStandaloneReader subscribe finished.", r.stat.Name)
-			r.needDumpQueue.Close()
+			r.closeInputQueues()
 			return
 		default:
 			resp, err := c.Receive()
@@ -228,11 +258,15 @@ func (r *scanStandaloneReader) scan() {
 
 		var cursor uint64 = 0
 		count := r.opts.Count
+		// pending buffers scanned key names for a batched TYPE probe (StreamLists only);
+		// classifyAndRoute sends lists to the stream pool and the rest to the dump path.
+		var pending []string
+		const classifyBatch = 512
 		for {
 			select {
 			case <-r.ctx.Done():
 				log.Infof("[%s] scanStandaloneReader scan finished.", r.stat.Name)
-				r.needDumpQueue.Close()
+				r.closeInputQueues()
 				return
 			default:
 			}
@@ -249,6 +283,14 @@ func (r *scanStandaloneReader) scan() {
 					go r.streamBigKey(dbId, key)
 					continue
 				}
+				if r.opts.StreamLists {
+					pending = append(pending, key)
+					if len(pending) >= classifyBatch {
+						r.classifyAndRoute(c, dbId, pending)
+						pending = pending[:0]
+					}
+					continue
+				}
 				r.needDumpQueue.Put(dbKey{dbId, key}) // pass value not pointer
 			}
 
@@ -261,10 +303,45 @@ func (r *scanStandaloneReader) scan() {
 				break
 			}
 		}
+		if len(pending) > 0 { // flush the tail of this db before switching SELECT
+			r.classifyAndRoute(c, dbId, pending)
+			pending = nil
+		}
 	}
 	r.stat.ScanFinished = true
 	if !r.opts.KSN {
-		r.needDumpQueue.Close()
+		r.closeInputQueues()
+	}
+}
+
+// closeInputQueues closes the dump queue and, when list streaming is enabled, the
+// stream queue — signalling the dump workers and the stream pool to drain and exit.
+func (r *scanStandaloneReader) closeInputQueues() {
+	r.needDumpQueue.Close()
+	if r.needStreamQueue != nil {
+		r.needStreamQueue.Close()
+	}
+}
+
+// classifyAndRoute probes TYPE for a batch of scanned keys in one pipelined round-trip
+// and routes each: list-typed keys go to the stream pool (LRANGE->RPUSH), everything
+// else stays on the fast DUMP/RESTORE path. Called only when StreamLists is set.
+func (r *scanStandaloneReader) classifyAndRoute(c *client.Redis, dbId int, keys []string) {
+	for _, k := range keys {
+		c.SendNoFlush("TYPE", k)
+	}
+	c.Flush()
+	for _, k := range keys {
+		reply, err := c.Receive()
+		if err != nil {
+			log.Panicf("[%s] classifyAndRoute TYPE failed key=[%s]: %v", r.stat.Name, k, err)
+		}
+		typ, _ := reply.(string)
+		if typ == "list" {
+			r.needStreamQueue.Put(dbKey{dbId, k})
+		} else {
+			r.needDumpQueue.Put(dbKey{dbId, k})
+		}
 	}
 }
 
@@ -438,10 +515,12 @@ func (r *scanStandaloneReader) emitBig(dbId int, argv []string) {
 	r.ch <- &entry.Entry{DbId: dbId, Argv: argv}
 }
 
-// streamBigKey replays one oversized key into the target via a type-native cursor
-// (ZSCAN/HSCAN/SSCAN/LRANGE/GET) on its own connection — NEVER DUMP, so neither the
+// streamBigKey replays one oversized key (from the explicit BigKeys list) into the
+// target via a type-native cursor on its own connection — NEVER DUMP, so neither the
 // source nor redis-shake ever materializes the whole value. Runs concurrently with the
 // small-key DUMP pipeline; gated by bigKeyWG so r.ch isn't closed before it finishes.
+// Per-key goroutine model: fine for the tiny hand-listed BigKeys set (for a keyspace-
+// sized set of lists use StreamLists + the pooled streamWorker instead).
 // Assumes a fresh target (no leading DEL).
 func (r *scanStandaloneReader) streamBigKey(dbId int, key string) {
 	defer r.bigKeyWG.Done()
@@ -452,9 +531,44 @@ func (r *scanStandaloneReader) streamBigKey(dbId int, key string) {
 			log.Panicf("[%s] streamBigKey SELECT failed db=[%d]", r.stat.Name, dbId)
 		}
 	}
-	typ := c.DoWithStringReply("TYPE", key)
-	log.Infof("[%s] streaming big key=[%s] type=[%s] via cursor (no DUMP)", r.stat.Name, key, typ)
+	log.Infof("[%s] streaming big key=[%s] via cursor (no DUMP)", r.stat.Name, key)
+	r.replayKeyViaCursor(c, dbId, key)
+}
 
+// streamWorker is one pooled connection draining needStreamQueue (list keys routed by
+// classifyAndRoute when StreamLists is set). Unlike streamBigKey it reuses a single
+// connection across many keys, SELECTing only on db change, so the connection count is
+// bounded by StreamParallel regardless of how many lists the keyspace holds.
+func (r *scanStandaloneReader) streamWorker() {
+	defer r.streamPoolWG.Done()
+	c := client.NewRedisClient(r.ctx, r.opts.Address, r.opts.Username, r.opts.Password, r.opts.Tls, r.opts.TlsConfig, r.opts.PreferReplica)
+	defer c.Close()
+	nowDbId := 0
+	for item := range r.needStreamQueue.Ch {
+		dbId := item.(dbKey).db
+		key := item.(dbKey).key
+		if nowDbId != dbId {
+			if reply := c.DoWithStringReply("SELECT", strconv.Itoa(dbId)); reply != "OK" {
+				log.Panicf("[%s] streamWorker SELECT failed db=[%d]", r.stat.Name, dbId)
+			}
+			nowDbId = dbId
+		}
+		// Leading DEL for idempotency: UniqueQueue only dedups pending items, so a key
+		// re-emitted by SCAN after it was already streamed would otherwise append a
+		// second copy. DEL is a no-op on the fresh/flushed rollback target for a key
+		// seen once, and rebuilds cleanly on a re-stream.
+		r.emitBig(dbId, []string{"DEL", key})
+		r.replayKeyViaCursor(c, dbId, key)
+	}
+	log.Infof("[%s] scanStandaloneReader streamWorker finished.", r.stat.Name)
+}
+
+// replayKeyViaCursor reads one key incrementally with a type-native cursor
+// (ZSCAN/HSCAN/SSCAN/LRANGE/GET) on the given connection and emits it as batched write
+// commands — NEVER DUMP. TYPE is re-checked here (not trusted from classification) so a
+// key whose type changed, or vanished, between SCAN and now is still handled correctly.
+func (r *scanStandaloneReader) replayKeyViaCursor(c *client.Redis, dbId int, key string) {
+	typ := c.DoWithStringReply("TYPE", key)
 	switch typ {
 	case "none":
 		return // key vanished between SCAN and now
@@ -471,7 +585,7 @@ func (r *scanStandaloneReader) streamBigKey(dbId int, key string) {
 			r.emitBig(dbId, []string{"SET", key, v.(string)})
 		}
 	default:
-		log.Panicf("[%s] streamBigKey unsupported type=[%s] key=[%s]", r.stat.Name, typ, key)
+		log.Panicf("[%s] replayKeyViaCursor unsupported type=[%s] key=[%s]", r.stat.Name, typ, key)
 	}
 
 	if p, ok := c.Do("PTTL", key).(int64); ok && p > 0 {
